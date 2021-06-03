@@ -35,7 +35,7 @@ AQS 提供了一个框架来实现阻塞锁和相关的同步器（比如信号�
 - 阻塞式调用情形下，允许设置超时。
 - 允许通过中断的方式取消 acuqire 操作。
 
-## AQS 源码分析
+## AQS 源码组成
 
 ### State
 
@@ -106,6 +106,490 @@ static {
 CLH 解决上述两个问题的办法是通过一个单向链表来实现排它自旋锁。首先对于公平性的问题，采取队列来实现，进来的线程排在队尾，当获得锁的线程释放锁，队首的线程将获得锁，这样就解决了公平性的问题。而对于 CPU 通信开销，则是通过队列前一个节点保存的状态信息来决定当前线程的状态。所以每个 CPU 自旋时获取锁的状态取决于前一个节点，而不是所有 CPU 访问一个共享内存地址。
 
 AQS 的 FIFO 队列
+
+```java
+static final class Node {
+
+    static final Node SHARED = new Node();
+
+    static final Node EXCLUSIVE = null;
+
+    static final int CANCELLED =  1;
+
+    static final int SIGNAL    = -1;
+
+    static final int CONDITION = -2;
+
+    static final int PROPAGATE = -3;
+
+    volatile int waitStatus;
+
+    volatile Node prev;
+
+    volatile Node next;
+
+    volatile Thread thread;
+
+    Node nextWaiter;
+
+    final boolean isShared() {
+        return nextWaiter == SHARED;
+    }
+
+    final Node predecessor() throws NullPointerException {
+        Node p = prev;
+        if (p == null)
+            throw new NullPointerException();
+        else
+            return p;
+    }
+
+    Node() {    // Used to establish initial head or SHARED marker
+    }
+
+    Node(Thread thread, Node mode) {     // Used by addWaiter
+        this.nextWaiter = mode;
+        this.thread = thread;
+    }
+
+    Node(Thread thread, int waitStatus) { // Used by Condition
+        this.waitStatus = waitStatus;
+        this.thread = thread;
+    }
+}
+```
+
+
+
+## AQS 源码执行流程分析
+
+AQS 的源码顶部注释提供了一个互斥锁的案例，我们从这个案例来分析 AQS 的执行流程，代码如下 ：
+
+```java
+public class Mutex implements Lock, Serializable {
+    
+    // Our internal helper class
+    private static class Sync extends AbstractQueuedSynchronizer {
+        // Reports whether in locked state
+        protected boolean isHeldExclusively() {
+            return getState() == 1;
+        }
+
+        // Acquires the lock if state is zero
+        public boolean tryAcquire(int acquires) {
+            assert acquires == 1; // Otherwise unused
+            if (compareAndSetState(0, 1)) {
+                setExclusiveOwnerThread(Thread.currentThread());
+                return true;
+            }
+            return false;
+        }
+
+        // Releases the lock by setting state to zero
+        protected boolean tryRelease(int releases) {
+            assert releases == 1; // Otherwise unused
+            if (getState() == 0) throw new IllegalMonitorStateException();
+            setExclusiveOwnerThread(null);
+            setState(0);
+            return true;
+        }
+
+        // Provides a Condition
+        Condition newCondition() {
+            return new ConditionObject();
+        }
+
+        // Deserializes properly
+        private void readObject(ObjectInputStream s) throws IOException, ClassNotFoundException {
+            s.defaultReadObject();
+            setState(0); // reset to unlocked state
+        }
+
+    }
+
+    // The sync object does all the hard work. We just forward to it.
+    private final Sync sync = new Sync();
+
+    public void lock() {
+        sync.acquire(1);
+    }
+
+    public boolean tryLock() {
+        return sync.tryAcquire(1);
+    }
+
+    public void unlock() {
+        sync.release(1);
+    }
+
+    public Condition newCondition() {
+        return sync.newCondition();
+    }
+
+    public boolean isLocked() {
+        return sync.isHeldExclusively();
+    }
+
+    public boolean hasQueuedThreads() {
+        return sync.hasQueuedThreads();
+    }
+
+    public void lockInterruptibly() throws InterruptedException {
+        sync.acquireInterruptibly(1);
+    }
+
+    public boolean tryLock(long timeout, TimeUnit unit)
+            throws InterruptedException {
+        return sync.tryAcquireNanos(1, unit.toNanos(timeout));
+    }
+}
+
+```
+
+编写一个测试用例：
+
+```java
+public class MutexTest {
+
+    static Mutex lock = new Mutex();
+    static Integer num = 0;
+
+    public static void main(String[] args) throws InterruptedException {
+
+
+        Thread ta = new Thread(() -> {
+            try {
+                lock.lock();
+                System.out.println("Thread A get lock");
+                num = 2;
+                try {
+                    TimeUnit.SECONDS.sleep(20);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            } finally {
+                lock.unlock();
+                System.out.println("Thread A unlock");
+            }
+        }, "Thread A");
+
+
+        Thread tb = new Thread(() -> {
+            try {
+                lock.lock();
+                System.out.println("Thread B get lock");
+                num = 5;
+
+            } finally {
+                lock.unlock();
+                System.out.println("Thread B unlock");
+            }
+        }, "Thread B");
+
+        ta.start();
+        tb.start();
+
+        ta.join();
+        tb.join();
+
+    }
+}
+```
+
+### 获取锁流程
+对于 A、B 两个线程，开始执行后通过 `lock.lock();` 尝试上锁：
+
+```java
+public void lock() {
+    sync.acquire(1);
+}
+```
+
+其中 `lock` 方法会调用 `sync.acquire(1);`，这个方法是 AQS 封装为 final 的方法。
+
+```java
+public final void acquire(int arg) {
+    if (!tryAcquire(arg) &&
+        acquireQueued(addWaiter(Node.EXCLUSIVE), arg))
+        selfInterrupt();
+}
+```
+
+#### tryAcquire
+
+对于 `tryAcquire(int arg)` 这个尝试获取锁的方法，AQS 定义为模板方法，子类必须实现，否则抛出不支持操作异常，	标准的模板方法设计模式。
+
+```java
+protected boolean tryAcquire(int arg) {
+    throw new UnsupportedOperationException();
+}
+```
+
+Mutex 的实现如下：
+
+```java
+public boolean tryAcquire(int acquires) {
+    // 定义 state 的值为 1 表示上锁成功。
+    assert acquires == 1; // Otherwise unused
+    // 通过 CAS 加锁，第一个进来的线程会成功上锁
+    if (compareAndSetState(0, 1)) {
+        // 在 AbstractOwnableSynchronizer 中将该线程设置为独占线程
+        setExclusiveOwnerThread(Thread.currentThread());
+        // 由于返回 true，在 acquire() 中返回，即第一个线程加锁成功
+        return true;
+    }
+    // 获取锁失败
+    return false;
+}
+```
+
+#### addWaiter
+
+> Creates and enqueues node for current thread and given mode.
+
+将当前线程封装成一个 Node，并且入队。源码如下：
+
+```java
+private Node addWaiter(Node mode) {
+    // 将当前线程封装成一个 Node
+    Node node = new Node(Thread.currentThread(), mode);
+    // Try the fast path of enq; backup to full enq on failure
+    Node pred = tail;
+
+    if (pred != null) {
+        node.prev = pred;
+        if (compareAndSetTail(pred, node)) {
+            pred.next = node;
+            return node;
+        }
+    }
+    // 当 tail 节点为空时，会执行入队方法。
+    enq(node);
+    return node;
+}
+```
+
+先分析第一次入队，即 `enq(final Node node)`：
+
+对于第一次循环，此时尾节点的指针为空（懒加载），所以必须初始化，会创建一个新的 Node，并且放置在 head 的内存地址，然后 tail 也指向该内存地址。这个新建的 Node，网上称为哨兵节点。
+
+对于第二次循环，此时尾部节点已经存在了，所以走 else 的逻辑，将参数 node 的 prev 指针指向 tail，即哨兵节点。再通过 CAS 将尾节点指针指向当前节点，最后将哨兵节点的 next 指向传入的 node，形成双向列表后返回传入的节点。
+
+```java
+private Node enq(final Node node) {
+    for (;;) {
+        Node t = tail;
+        // 尾节点为空，初始化
+        if (t == null) { // Must initialize
+            if (compareAndSetHead(new Node()))
+                tail = head;
+        } else {
+            // 设置尾结点指针指向当前传入的节点
+            // 和之前的尾结点形成双向链表
+            node.prev = t;
+            if (compareAndSetTail(t, node)) {
+                t.next = node;
+                return t;
+            }
+        }
+    }
+}
+
+// 头指针的内存地址
+private static final long headOffset;
+// 尾指针的内存地址
+private static final long tailOffset;
+
+private final boolean compareAndSetHead(Node update) {
+    return unsafe.compareAndSwapObject(this, headOffset, null, update);
+}
+
+private final boolean compareAndSetTail(Node expect, Node update) {
+    return unsafe.compareAndSwapObject(this, tailOffset, expect, update);
+}
+```
+
+#### acquireQueued
+
+当 addWaiter 将当前节点入队后，会执行 acquireQueued 方法，返回值 interrupted 表示当前节点是否被标记为打断。
+
+```java
+final boolean acquireQueued(final Node node, int arg) {
+    // 当出现异常，failed 会执行 cancelAcquire()
+    boolean failed = true;
+    try {
+        boolean interrupted = false;
+        for (;;) {
+            // p 为 node 的前节点
+            final Node p = node.predecessor();
+            // 前驱节点为 head 节点，并且再次尝试获取锁成功
+            if (p == head && tryAcquire(arg)) {
+                // 如果当前 Node 获取成功了
+                // 将当前节点设置为头节点，并且清空 node 中的 thread 和 前指针
+                setHead(node);
+                // 将之前的头节点的 next 指针置空，方便 GC
+                p.next = null; // help GC
+                failed = false;
+                // 返回 false
+                return interrupted;
+            }
+            // 如果不是头节点，或者获取锁失败了
+            // 先处理 ws，循环多次后，会将前置节点的 ws 置为 true
+            // 然后将当前线程 LockSupport.park() 
+            if (shouldParkAfterFailedAcquire(p, node) &&
+                parkAndCheckInterrupt())
+                interrupted = true;
+        }
+    } finally {
+        if (failed)
+            cancelAcquire(node);
+    }
+}
+
+private void setHead(Node node) {
+    head = node;
+    node.thread = null;
+    node.prev = null;
+}
+
+// 获取失败后，将前置节点的 ws 设置为 SIGNAL，才返回 true，并且通过指针过滤一些 Cancelled 的节点，多次循环必返回 true
+private static boolean shouldParkAfterFailedAcquire(Node pred, Node node) {
+    int ws = pred.waitStatus;
+    // 如果前置节点是 -1，那么返回 true，表示后记节点在等待唤醒。
+    if (ws == Node.SIGNAL)
+        return true;
+    // ws 大于 0，前节点可能被 cancelled（CANCELLED(1)），所以需要跳过他们，并且更改指针
+    // 将当前 node 节点的指针指向 ws <= 0 的节点上。
+    // 并且 pred 也变成了 ws <= 0 的节点
+    // 返回 false
+    if (ws > 0) {
+        do {
+            node.prev = pred = pred.prev;
+        } while (pred.waitStatus > 0);
+        pred.next = node;
+    } else {
+        // ws = 0 或者 ws = PROPAGATE（-3）共享模式下，前继结点不仅会唤醒其后继结点，同时也可能会唤醒后继的后继结点。
+        // 将前置节点的 ws 设置为 -1
+        // 返回 false
+        compareAndSetWaitStatus(pred, ws, Node.SIGNAL);
+    }
+    return false;
+}
+
+// waitStatus 的内存地址
+private static final long waitStatusOffset;
+
+private static final boolean compareAndSetWaitStatus(Node node,
+                                                     int expect,
+                                                     int update) {
+    return unsafe.compareAndSwapInt(node, waitStatusOffset,
+                                    expect, update);
+}
+
+// 阻塞当前线程
+private final boolean parkAndCheckInterrupt() {
+    LockSupport.park(this);
+    return Thread.interrupted();
+}
+```
+
+### 释放锁流程
+
+对于获取锁的线程，执行结束后通过 `lock.unlock();`  释放锁：
+
+```java
+public void unlock() {
+    sync.release(1);
+}
+
+public final boolean release(int arg) {
+    if (tryRelease(arg)) {
+        // 拿到当前 AQS 的头节点，哨兵节点
+        Node h = head;
+        // 哨兵节点不为空，并且 ws ！= 0
+        if (h != null && h.waitStatus != 0)
+            // 唤醒后面的线程的线程
+            unparkSuccessor(h);
+        return true;
+    }
+    return false;
+}
+```
+
+同样 `tryRelease()` 是模板方法，Mutex 实现如下：
+
+```java
+protected boolean tryRelease(int arg) {
+    throw new UnsupportedOperationException();
+}
+
+// 将 AQS 独占线程置空，共享 state 设置为 0
+protected boolean tryRelease(int releases) {
+    assert releases == 1; // Otherwise unused
+    if (getState() == 0) throw new IllegalMonitorStateException();
+    setExclusiveOwnerThread(null);
+    setState(0);
+    return true;
+}
+```
+
+释放后继的代码：
+
+```java
+private void unparkSuccessor(Node node) {
+	// 这个是头节点
+    int ws = node.waitStatus;
+    if (ws < 0)
+        compareAndSetWaitStatus(node, ws, 0);
+
+    Node s = node.next;
+    if (s == null || s.waitStatus > 0) {
+        s = null;
+        for (Node t = tail; t != null && t != node; t = t.prev)
+            if (t.waitStatus <= 0)
+                s = t;
+    }
+    if (s != null)
+        LockSupport.unpark(s.thread);
+}
+```
+
+
+
+https://www.cnblogs.com/waterystone/p/4920797.html
+
+
+
+
+
+
+
+
+
+
+
+```java
+public boolean offer(E e) {
+    checkNotNull(e);
+    final Node<E> newNode = new Node<E>(e);
+
+    for (Node<E> t = tail, p = t;;) {
+        Node<E> q = p.next;
+        if (q == null) {
+
+            if (p.casNext(null, newNode)) {
+                if (p != t) // hop two nodes at a time
+                    casTail(t, newNode);  // Failure is OK.
+                return true;
+            }
+        }
+        else if (p == q)
+            p = (t != (t = tail)) ? t : head;
+        else
+            p = (p != t && t != (t = tail)) ? t : q;
+    }
+}
+```
 
 
 
